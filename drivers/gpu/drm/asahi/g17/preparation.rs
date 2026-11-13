@@ -23,12 +23,18 @@ const EPOCH: u64 = CLOSED << 3;
 
 /// One ready packet's monotonic compute-admission budget. The callback checks
 /// packet cancellation, logical close, VM status and device loss even when no
-/// capacity/recovery event arrives. Wakes and nested constructors never renew it.
+/// capacity/recovery event arrives. Wakes and nested constructors never renew it; a
+/// release observed while waiting does ([`Self::renew_on_progress`]).
 pub(super) struct Admission<'a> {
     deadline: Cell<u64>,
     started: u64,
+    /// The wait's own bound, from its start to its first deadline.
+    window: u64,
     check: &'a dyn Fn() -> Result,
 }
+
+/// Releases renew a wait at most to this many of its windows from its start.
+const PROGRESS_WINDOWS: u64 = 4;
 
 /// Bound for a compute publication's waits: a physical compute queue, or room on the shared
 /// work ring, frees only as other owners' work retires or goes idle.
@@ -36,7 +42,20 @@ pub(super) const QUEUE_WAIT_NS: u64 = 30_000_000_000;
 
 impl<'a> Admission<'a> {
     pub(super) fn new(deadline: u64, check: &'a dyn Fn() -> Result) -> Self {
-        Self { deadline: Cell::new(deadline), started: super::now_ns(), check }
+        let started = super::now_ns();
+        Self { deadline: Cell::new(deadline), started, window: deadline.saturating_sub(started), check }
+    }
+
+    /// Capacity was released while this packet waited, to other owners as well: the wait
+    /// is contended, not stalled. Measure its bound from now, so that it only expires after a
+    /// whole window without any release, and never beyond [`PROGRESS_WINDOWS`] windows from
+    /// its start.
+    pub(super) fn renew_on_progress(&self) {
+        let cap = self.started.saturating_add(self.window.saturating_mul(PROGRESS_WINDOWS));
+        let renewed = super::now_ns().saturating_add(self.window).min(cap);
+        if renewed > self.deadline.get() {
+            self.deadline.set(renewed);
+        }
     }
 
     /// A recovery is pending or this owner's spared work drains: wait as long as the

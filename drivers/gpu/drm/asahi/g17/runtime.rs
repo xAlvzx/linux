@@ -2749,6 +2749,11 @@ impl Backend {
                 return Err(Error::from_errno(waited as i32));
             }
         }
+        // A release (retirement, ring room, a replay or reopened publication) means the
+        // capacity this packet waits for is moving, even when another owner took it first.
+        if domain.observe() != observed {
+            admission.renew_on_progress();
+        }
         admission.check()
     }
 
